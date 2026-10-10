@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: dota-spread
+    runtime: docker
+    plan: free
+    region: frankfurt
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: UPDATE_INTERVAL
+        value: "10"
+      - key: STEAM_BATCH_SIZE
+        value: "3"
+      - key: LIS_REFRESH_INTERVAL
+        value: "60"
+      - key: QUOTE_TTL
+        value: "120"

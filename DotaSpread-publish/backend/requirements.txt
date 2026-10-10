@@ -1,0 +1,4 @@
+Flask>=3.1,<4
+requests>=2.32,<3
+ijson>=3.4,<4
+gunicorn>=26.2,<27
