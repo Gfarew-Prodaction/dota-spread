@@ -8,9 +8,8 @@ services:
     dockerfilePath: ./Dockerfile
     dockerContext: .
     healthCheckPath: /api/health
+    # COLLECTOR_ROLE is set manually in Render; later syncs preserve home collection.
     envVars:
-      - key: COLLECTOR_ROLE
-        value: "all"
       - key: UPDATE_INTERVAL
         value: "10"
       - key: STEAM_BATCH_SIZE
@@ -26,7 +25,7 @@ services:
       - key: STEAM_REQUEST_INTERVAL
         value: "4"
       - key: STEAM_PRIORITY_SIZE
-        value: "400"
+        value: "200"
       - key: STEAMAPIS_REFRESH_INTERVAL
         value: "60"
       - key: STEAMAPIS_CURRENCY

@@ -16,7 +16,7 @@ class MarketService:
     def __init__(self, store, interval=10, batch_size=3, quote_ttl=120,
                  catalog_interval=60, catalog_ttl=600, pending_ttl=1800,
                  steam_request_interval=4, collector_role='all', worker_id=None,
-                 priority_size=400, bulk_key='', bulk_interval=60, bulk_currency='USD'):
+                 priority_size=200, bulk_key='', bulk_interval=60, bulk_currency='USD'):
         if collector_role not in ('all', 'sources', 'steam', 'none'):
             raise ValueError('COLLECTOR_ROLE: all, sources, steam или none.')
         if bulk_currency not in ('USD', 'EUR'):
@@ -42,6 +42,7 @@ class MarketService:
         self.bulk_session = client()
         self.bulk_orders = None
         self.catalog, self.quotes, self.fx = [], {}, None
+        self.catalog_drops = {}
         self.catalog_updated_at = self.catalog_checked_at = 0
         self.catalog_etag = None
         self.skipped = 0
@@ -139,7 +140,7 @@ class MarketService:
                 self._storage_error()
                 return False
             with self.lock:
-                for key in ('catalog', 'catalog_updated_at', 'catalog_checked_at', 'catalog_etag', 'skipped', 'fx', 'bulk_orders'):
+                for key in ('catalog', 'catalog_drops', 'catalog_updated_at', 'catalog_checked_at', 'catalog_etag', 'skipped', 'fx', 'bulk_orders'):
                     if key in data:
                         setattr(self, key, data[key])
                 if data['incremental']:
@@ -251,9 +252,27 @@ class MarketService:
         saved = {'catalog_checked_at': time.time(), 'catalog_etag': self.catalog_etag}
         if result is not None:
             catalog, updated, skipped, etag = result
-            saved.update(catalog=catalog, catalog_updated_at=updated, skipped=skipped, catalog_etag=etag)
+            saved.update(catalog=catalog, catalog_drops=self.find_catalog_drops(catalog, saved['catalog_checked_at']),
+                         catalog_updated_at=updated, skipped=skipped, catalog_etag=etag)
         # A 304 checks availability without changing the source's price timestamp.
         self._complete('lis', claim, 'Каталог доступен', values=saved)
+
+    def find_catalog_drops(self, catalog, now):
+        """Keep one-hour price-drop hints, separate from verified Steam quotes."""
+        with self.lock:
+            previous = {item['name']: Decimal(item['price']) for item in self.catalog}
+            existing = dict(self.catalog_drops)
+        drops = {}
+        for item in catalog:
+            name, price = item['name'], Decimal(item['price'])
+            old_price = previous.get(name)
+            if old_price and price < old_price:
+                drops[name] = {'price': item['price'], 'changed_at': now,
+                               'percent': float((old_price - price) / old_price * 100)}
+            elif name in existing and Decimal(existing[name]['price']) == price \
+                    and now - existing[name]['changed_at'] <= 3600:
+                drops[name] = existing[name]
+        return drops
 
     def collect_fx(self):
         if time.time() < self.retry_at['fx'] or (self.fx and time.time() - self.fx['checked_at'] < 3600):
@@ -280,6 +299,7 @@ class MarketService:
             fx = self.fx
             turn = self.scan_turn
             bulk = self.bulk_orders
+            catalog_drops = dict(self.catalog_drops)
         rank = lambda item: (attempted.get(item['name'], quotes.get(item['name'], {}).get('checked_at', 0)), not (.5 <= float(item['price']) <= 50), -min(item['stock'], 100))
         entries = bulk['entries'] if bulk and now - bulk['generated_at'] <= 86400 else {}
         focus = sorted(catalog, key=lambda item: (not (.5 <= float(item['price']) <= 50),
@@ -313,22 +333,34 @@ class MarketService:
         potential.sort(key=lambda entry: (-entry[1], -entry[2], rank(entry[0])))
         suggested = [entry[0] for entry in potential]
         suggested_names = {item['name'] for item in suggested}
+        dropped = []
+        for item in catalog:
+            name = item['name']
+            drop = catalog_drops.get(name)
+            last_check = checked_at.get(name, quotes.get(name, {}).get('checked_at', 0))
+            if drop and Decimal(drop['price']) == Decimal(item['price']) \
+                    and 0 <= now - drop['changed_at'] <= 3600 and last_check < drop['changed_at'] \
+                    and (drop['percent'] >= 5 or name in profitable_names):
+                dropped.append(item)
+        dropped.sort(key=lambda item: (item['name'] not in profitable_names,
+                                      -catalog_drops[item['name']]['percent'], rank(item)))
+        dropped_names = {item['name'] for item in dropped}
         def eligible(item):
             name = item['name']
             if now - attempted.get(name, 0) < self.request_interval:
                 return False
             last_check = checked_at.get(name, quotes.get(name, {}).get('checked_at', 0))
             repeat_after = max(30, self.quote_ttl * .6) if name in profitable_names else 900
-            return name in suggested_names or name not in attempted or now - last_check >= repeat_after
+            return name in suggested_names or name in dropped_names or name not in attempted or now - last_check >= repeat_after
         selected, picked = [], set()
         for offset in range(self.batch_size):
             slot = turn + offset
             if slot % 10 == 9:
                 queues = (outside_unseen, unseen, rotating)
             elif slot % 3 == 2:
-                queues = (due, suggested, focused_unseen, focused_rotating, unseen, rotating)
+                queues = (due, suggested, dropped, focused_unseen, focused_rotating, unseen, rotating)
             else:
-                queues = (suggested, focused_unseen, due, focused_rotating, unseen, rotating)
+                queues = (suggested, dropped, focused_unseen, due, focused_rotating, unseen, rotating)
             # Discovery falls back to rotating checks when the catalog is covered.
             # Avoid rechecking an otherwise fresh quote just because it is in focus.
             item = next((entry for queue in queues for entry in queue
