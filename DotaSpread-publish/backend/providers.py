@@ -1,8 +1,10 @@
 import json
+import math
 import re
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from urllib.parse import quote
 from xml.etree import ElementTree
 
@@ -15,9 +17,10 @@ STEAM_CURRENCIES = {1: 'USD', 3: 'EUR', 5: 'RUB'}
 
 
 class SourceError(Exception):
-    def __init__(self, message, retry_after=60):
+    def __init__(self, message, retry_after=60, kind='item'):
         super().__init__(message)
         self.retry_after = retry_after
+        self.kind = kind
 
 
 def client():
@@ -26,23 +29,41 @@ def client():
     return session
 
 
+def retry_delay(value, fallback=120):
+    try:
+        return max(1, int(value))
+    except (ValueError, TypeError):
+        try:
+            return max(1, math.ceil(parsedate_to_datetime(value).timestamp() - time.time()))
+        except (ValueError, TypeError, OverflowError):
+            return fallback
+
+
 def checked_response(response):
     if response.status_code == 429:
         retry = response.headers.get('Retry-After', '120')
-        raise SourceError('Источник ограничил частоту запросов. Сбор временно приостановлен.', int(retry) if retry.isdigit() else 120)
+        raise SourceError('Источник ограничил частоту запросов. Ожидаем повторную проверку.', retry_delay(retry), kind='rate_limit')
     if response.status_code in (401, 403):
-        raise SourceError('Источник временно отклонил запросы.', 120)
+        raise SourceError('Источник временно отклонил запросы.', 300, kind='access')
+    if response.status_code >= 500:
+        raise SourceError('Источник временно недоступен.', retry_delay(response.headers.get('Retry-After'), 60), kind='unavailable')
+    if response.status_code in (404, 410):
+        raise SourceError('Предмет или ресурс больше не доступен.')
     response.raise_for_status()
     return response
 
 
-def read_catalog(session):
+def read_catalog(session, etag=None):
     """Stream the large official export instead of allocating 273k records."""
     grouped = {}
     updated_at = None
     skipped = 0
     now = time.time()
-    with checked_response(session.get(LIS_EXPORT, stream=True, timeout=(10, 60))) as response:
+    headers = {'If-None-Match': etag} if etag else {}
+    with checked_response(session.get(LIS_EXPORT, headers=headers, stream=True, timeout=(10, 60))) as response:
+        if response.status_code == 304:
+            return None
+        response_etag = response.headers.get('ETag')
         response.raw.decode_content = True
         builder = None
         for prefix, event, value in ijson.parse(response.raw):
@@ -82,7 +103,7 @@ def read_catalog(session):
                         entry['listing_id'] = item.get('id')
     if not grouped or updated_at is None:
         raise SourceError('Выгрузка Lis-Skins не содержит ожидаемых цен или времени обновления.')
-    return [{**item, 'price': str(item['price'])} for item in grouped.values()], updated_at, skipped
+    return [{**item, 'price': str(item['price'])} for item in grouped.values()], updated_at, skipped, response_etag
 
 
 def read_fx(session):
@@ -102,7 +123,7 @@ def parse_steam_page(html, name, checked_at=None):
     """Read the public order book in Steam's current SSR page, checking its identity."""
     match = re.search(r'<script\b[^>]*\bid=[\"\']valve-ssr-data[\"\'][^>]*>(.*?)</script>', html, re.S)
     if not match:
-        raise SourceError('Страница Steam не содержит стакан ордеров. Требуется обновление адаптера.')
+        raise SourceError('Steam не вернул страницу с ордерами. Повторим проверку позже.', kind='unavailable')
     root = json.loads(match.group(1))
     query_data = root.get('renderContext', {}).get('queryData', {})
     if isinstance(query_data, str):

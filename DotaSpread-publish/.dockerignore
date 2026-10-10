@@ -1,0 +1,12 @@
+.git
+.venv
+.cache
+.env
+.env.*
+**/node_modules
+**/dist
+**/__pycache__
+**/*.pyc
+**/*.sqlite3*
+**/.DS_Store
+*.zip

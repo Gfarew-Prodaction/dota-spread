@@ -1,9 +1,11 @@
 import io
 import json
 import tempfile
+import threading
 import time
 import unittest
 from decimal import Decimal
+from email.utils import formatdate
 from pathlib import Path
 from unittest.mock import patch
 
@@ -78,18 +80,20 @@ class ProviderTests(unittest.TestCase):
         ]}
         class Response:
             status_code = 200
+            headers = {'ETag': '"test-export"'}
             def __init__(self): self.raw = io.BytesIO(json.dumps(payload).encode())
             def raise_for_status(self): pass
             def __enter__(self): return self
             def __exit__(self, *args): pass
         class Session:
             def get(self, *args, **kwargs): return Response()
-        catalog, _, skipped = read_catalog(Session())
+        catalog, _, skipped, etag = read_catalog(Session())
         self.assertEqual(len(catalog), 1)
         self.assertEqual(catalog[0]['price'], '2')
         self.assertEqual(catalog[0]['listing_id'], 2)
         self.assertEqual(catalog[0]['stock'], 2)
         self.assertEqual(skipped, 3)
+        self.assertEqual(etag, '"test-export"')
 
     def test_source_throttling_is_honoured(self):
         class Response:
@@ -98,6 +102,32 @@ class ProviderTests(unittest.TestCase):
         with self.assertRaises(SourceError) as error:
             checked_response(Response())
         self.assertEqual(error.exception.retry_after, 180)
+        self.assertEqual(error.exception.kind, 'rate_limit')
+
+    def test_retry_after_http_date_is_honoured(self):
+        class Response:
+            status_code = 429
+            headers = {'Retry-After': formatdate(time.time() + 600, usegmt=True)}
+        with self.assertRaises(SourceError) as error:
+            checked_response(Response())
+        self.assertGreaterEqual(error.exception.retry_after, 599)
+
+    def test_unchanged_export_avoids_download_and_parsing(self):
+        class Response:
+            status_code = 304
+            def raise_for_status(self): pass
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+        from unittest.mock import Mock
+        session = Mock()
+        session.get.return_value = Response()
+        self.assertIsNone(read_catalog(session, '"export-version"'))
+        self.assertEqual(session.get.call_args.kwargs['headers']['If-None-Match'], '"export-version"')
+
+    def test_missing_steam_page_is_a_source_error_not_a_removed_item(self):
+        with self.assertRaises(SourceError) as error:
+            parse_steam_page('<html>Temporarily unavailable</html>', 'Test skin')
+        self.assertEqual(error.exception.kind, 'unavailable')
 
 
 class SnapshotTests(unittest.TestCase):
@@ -112,7 +142,7 @@ class SnapshotTests(unittest.TestCase):
         self.service.quotes = {'Test skin': parse_steam_page(steam_html(), 'Test skin')}
 
     def tearDown(self):
-        self.service.session.close()
+        self.service.close()
         self.directory.cleanup()
 
     def test_profitable_live_quote_is_displayed(self):
@@ -133,10 +163,33 @@ class SnapshotTests(unittest.TestCase):
         result = self.service.snapshot()
         self.assertEqual(result['items'], [])
         self.assertEqual(result['stale_quotes'], 1)
+        self.assertEqual(result['pending_total'], 1)
+        self.assertFalse(result['pending_items'][0]['fresh'])
+        self.assertEqual(result['pending_items'][0]['waiting_reason'], 'ордер Steam')
 
     def test_stale_lis_price_is_hidden(self):
-        self.service.catalog_updated_at -= 181
+        self.service.catalog_updated_at -= 601
         self.assertEqual(self.service.snapshot()['items'], [])
+        self.assertEqual(self.service.snapshot()['pending_items'][0]['waiting_reason'], 'цена Lis-Skins')
+
+    def test_normal_export_lag_does_not_remove_fresh_orders(self):
+        self.service.catalog_updated_at -= 199
+        result = self.service.snapshot()
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(result['catalog_ttl_seconds'], 600)
+
+    def test_old_pending_rows_eventually_expire(self):
+        self.service.quotes['Test skin']['updated_at'] -= 1801
+        result = self.service.snapshot()
+        self.assertEqual(result['pending_items'], [])
+        self.assertEqual(result['items'], [])
+
+    def test_order_refresh_restores_pending_row(self):
+        self.service.quotes['Test skin']['updated_at'] -= 121
+        self.assertEqual(self.service.snapshot()['pending_total'], 1)
+        self.service.quotes['Test skin'] = parse_steam_page(steam_html(), 'Test skin')
+        self.assertEqual(self.service.snapshot()['profitable_total'], 1)
+        self.assertEqual(self.service.snapshot()['pending_total'], 0)
 
     def test_stale_exchange_rate_is_hidden(self):
         self.service.fx['checked_at'] -= 86400 * 4
@@ -159,7 +212,7 @@ class SnapshotTests(unittest.TestCase):
         self.store.put('quotes', self.service.quotes)
         service = MarketService(self.store)
         self.assertEqual(service.quotes['Test skin']['bid_cents'], 138)
-        service.session.close()
+        service.close()
 
     def test_collector_does_not_retry_throttled_source(self):
         self.service.retry_at['steam'] = time.time() + 60
@@ -172,6 +225,82 @@ class SnapshotTests(unittest.TestCase):
         self.service.quotes['Test skin']['checked_at'] -= 20
         self.service.catalog.append({'name': 'Other skin', 'price': '1', 'stock': 1, 'listing_id': 2})
         self.assertEqual(len(self.service.choose_candidates()), 1)
+
+    def test_discovery_gets_two_slots_before_due_winner(self):
+        self.service.quotes['Test skin']['checked_at'] -= 80
+        for index in range(3):
+            self.service.catalog.append({'name': f'New skin {index}', 'price': '1', 'stock': 2, 'listing_id': index + 2})
+        selected = [item['name'] for item in self.service.choose_candidates()]
+        self.assertTrue(selected[0].startswith('New skin'))
+        self.assertTrue(selected[1].startswith('New skin'))
+        self.assertEqual(selected[2], 'Test skin')
+
+    def test_fresh_winner_is_not_repeated_ahead_of_new_items(self):
+        for index in range(3):
+            self.service.catalog.append({'name': f'New skin {index}', 'price': '1', 'stock': 2, 'listing_id': index + 2})
+        self.assertNotIn('Test skin', [item['name'] for item in self.service.choose_candidates()])
+
+    def test_requests_are_spaced_even_when_api_is_polled_often(self):
+        with patch('backend.service.read_steam', return_value=self.service.quotes['Test skin']) as read:
+            self.service.collect_steam(limit=1)
+            self.service.collect_steam(limit=1)
+            self.assertEqual(read.call_count, 1)
+
+    def test_short_retry_after_still_stops_collection_globally(self):
+        error = SourceError('Too many requests', retry_after=10, kind='rate_limit')
+        with patch('backend.service.read_steam', side_effect=error) as read:
+            self.service.collect_steam()
+            self.assertEqual(read.call_count, 1)
+        self.assertGreater(self.service.retry_at['steam'], time.time() + 290)
+        self.assertIn('Test skin', self.service.quotes)
+
+    def test_rate_limit_backoff_and_progress_survive_restart(self):
+        self.service.fail('steam', SourceError('limit', 20, kind='rate_limit'))
+        self.assertEqual(self.service.request_interval, 8)
+        self.service.succeed('steam', 'One request succeeded')
+        self.service.fail('steam', SourceError('limit again', 20, kind='rate_limit'))
+        self.assertEqual(self.service.request_interval, 16)
+        self.assertGreater(self.service.retry_at['steam'], time.time() + 590)
+        restored = MarketService(self.store)
+        try:
+            self.assertEqual(restored.request_interval, 16)
+            self.assertEqual(restored.retry_at['steam'], self.service.retry_at['steam'])
+        finally:
+            restored.close()
+
+    def test_304_check_keeps_original_price_timestamp(self):
+        stamp = self.service.catalog_updated_at - 200
+        self.service.catalog_updated_at = stamp
+        with patch('backend.service.read_catalog', return_value=None):
+            self.service.collect_catalog()
+        self.assertEqual(self.service.catalog_updated_at, stamp)
+        self.assertGreater(self.service.catalog_checked_at, stamp)
+
+    def test_confirmed_unavailable_item_invalidates_old_quote(self):
+        with patch('backend.service.read_steam', side_effect=SourceError('Removed item')):
+            self.service.collect_steam(limit=1)
+        result = self.service.snapshot()
+        self.assertEqual(result['items'], [])
+        self.assertEqual(result['pending_items'], [])
+        self.assertEqual(result['checked_total'], 1)
+
+    def test_catalog_download_does_not_block_steam_scanning(self):
+        catalog_started, release_catalog, steam_called = threading.Event(), threading.Event(), threading.Event()
+        def slow_catalog():
+            catalog_started.set()
+            release_catalog.wait(3)
+        with patch.object(self.service, 'collect_catalog', side_effect=slow_catalog), \
+             patch.object(self.service, 'collect_fx'), \
+             patch.object(self.service, 'collect_steam', side_effect=lambda **kwargs: steam_called.set()):
+            self.service.start()
+            try:
+                self.assertTrue(catalog_started.wait(1))
+                self.assertTrue(steam_called.wait(1))
+            finally:
+                self.service.stop.set()
+                release_catalog.set()
+                self.service.thread.join(3)
+                self.service.source_thread.join(3)
 
 
 if __name__ == '__main__':

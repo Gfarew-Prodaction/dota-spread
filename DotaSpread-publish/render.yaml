@@ -2,9 +2,11 @@ services:
   - type: web
     name: dota-spread
     runtime: docker
+    rootDir: DotaSpread-publish
     plan: free
     region: frankfurt
     dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /api/health
     envVars:
       - key: UPDATE_INTERVAL
@@ -15,3 +17,9 @@ services:
         value: "60"
       - key: QUOTE_TTL
         value: "120"
+      - key: CATALOG_TTL
+        value: "600"
+      - key: PENDING_TTL
+        value: "1800"
+      - key: STEAM_REQUEST_INTERVAL
+        value: "4"
