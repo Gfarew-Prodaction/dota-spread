@@ -3,9 +3,9 @@ import math
 import re
 import time
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from email.utils import parsedate_to_datetime
-from urllib.parse import quote
+from urllib.parse import quote, urljoin, urlsplit
 from xml.etree import ElementTree
 
 import ijson
@@ -14,6 +14,7 @@ import requests
 LIS_EXPORT = 'https://lis-skins.com/market_export_json/api_dota2_full.json'
 CBR_URL = 'https://www.cbr.ru/scripts/XML_daily.asp'
 STEAM_CURRENCIES = {1: 'USD', 3: 'EUR', 5: 'RUB'}
+STEAMAPIS_LIST = 'https://api.steamapis.com/v2/steam/items/570/list'
 
 
 class SourceError(Exception):
@@ -163,3 +164,93 @@ def read_steam(session, name):
     url = 'https://steamcommunity.com/market/listings/570/' + quote(name, safe='')
     response = checked_response(session.get(url, params={'l': 'english', 'currency': 1}, timeout=(8, 18)))
     return parse_steam_page(response.text, name)
+
+
+class LimitedReader:
+    """Bound the decompressed export, including responses without Content-Length."""
+    def __init__(self, stream, limit=32 * 1024 * 1024):
+        self.stream, self.remaining = stream, limit
+
+    def read(self, size=-1):
+        data = self.stream.read(min(size, self.remaining + 1) if size >= 0 else self.remaining + 1)
+        self.remaining -= len(data)
+        if self.remaining < 0:
+            raise SourceError('Выгрузка ордеров превышает допустимый размер.', kind='unavailable')
+        return data
+
+
+def parse_bulk_orders(stream, currency='USD', now=None):
+    """Bulk data is a discovery hint, never a verified Steam quote."""
+    if currency not in ('USD', 'EUR'):
+        raise ValueError('STEAMAPIS_CURRENCY: USD или EUR.')
+    now = time.time() if now is None else now
+    metadata, entries, builder, building = {}, {}, None, None
+    count = 0
+    try:
+        for prefix, event, value in ijson.parse(LimitedReader(stream)):
+            if event == 'start_map' and prefix in ('metadata', 'items.item'):
+                builder, building = ijson.ObjectBuilder(), prefix
+            if builder is None:
+                continue
+            builder.event(event, value)
+            if prefix != building or event != 'end_map':
+                continue
+            item, section = builder.value, building
+            builder = building = None
+            if section == 'metadata':
+                metadata = item
+                continue
+            count += 1
+            name = item.get('marketHashName')
+            book = item.get('orderBook') or {}
+            if not isinstance(name, str) or not name or item.get('flags', {}).get('marketable') is False:
+                continue
+            try:
+                bid = Decimal(str(book.get('highestBuy')))
+                age = float(book.get('histogramAgeSeconds'))
+                stamp = float(item['updatedAt']) / 1000
+                quantity = sum(int(level['quantity']) for level in book.get('buyOrdersTop10', [])
+                               if Decimal(str(level['price'])) == bid and int(level['quantity']) > 0)
+                volume = max(0, int((item.get('volume') or {}).get('30d') or 0))
+                if not bid.is_finite() or bid <= 0 or not quantity or not math.isfinite(age) or age < 0 or not math.isfinite(stamp) or stamp <= 0:
+                    continue
+                entry = {'bid_cents': int(bid * 100), 'currency': currency, 'quantity': quantity,
+                         'updated_at': min(stamp, now) - age, 'volume_30d': volume, 'age': age}
+                if name not in entries or entry['updated_at'] > entries[name]['updated_at']:
+                    entries[name] = entry
+            except (ValueError, TypeError, KeyError, InvalidOperation, OverflowError):
+                continue
+        generated = float(metadata.get('generatedAt', 0)) / 1000
+        if metadata.get('appId') != 570 or not math.isfinite(generated) or generated <= 0 or generated > now + 300:
+            raise ValueError('Invalid app or snapshot timestamp')
+        if count == 0 or int(metadata.get('itemCount', count)) != count:
+            raise ValueError('Incomplete item list')
+    except (ijson.JSONError, ValueError, TypeError, AttributeError, InvalidOperation) as error:
+        raise SourceError('Выгрузка ордеров имеет неожиданный формат. Сохраняем прошлые данные.', kind='unavailable') from error
+    for entry in entries.values():
+        entry['updated_at'] = min(entry['updated_at'], generated - entry.pop('age'))
+    return {'entries': entries, 'generated_at': min(generated, now), 'downloaded_at': now,
+            'currency': currency, 'item_count': count}
+
+
+def read_bulk_orders(session, api_key, currency='USD'):
+    # Authenticate only the API request. A cross-host CDN redirect must never
+    # receive the API key, including on subsequent redirects.
+    url = STEAMAPIS_LIST
+    for step in range(4):
+        headers = {'x-api-key': api_key} if step == 0 else {}
+        with session.get(url, headers=headers, stream=True, allow_redirects=False, timeout=(8, 25)) as response:
+            if response.status_code in (301, 302, 303, 307, 308):
+                target = urljoin(url, response.headers.get('Location', ''))
+                parsed = urlsplit(target)
+                host = parsed.hostname or ''
+                if parsed.scheme != 'https' or parsed.username or parsed.password or parsed.port not in (None, 443) or not (host == 'steamapis.com' or host.endswith('.steamapis.com')):
+                    raise SourceError('SteamApis вернул неизвестный адрес выгрузки.', kind='unavailable')
+                url = target
+                continue
+            if response.status_code in (400, 401, 403):
+                raise SourceError('SteamApis: проверь ключ, баланс и доступ к App Price List.', 3600, kind='access')
+            checked_response(response)
+            response.raw.decode_content = True
+            return parse_bulk_orders(response.raw, currency)
+    raise SourceError('SteamApis не вернул файл ордеров.', kind='unavailable')

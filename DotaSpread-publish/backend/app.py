@@ -25,6 +25,10 @@ def create_service(default_role='all'):
         steam_request_interval=max(2, float(os.getenv('STEAM_REQUEST_INTERVAL', '4'))),
         collector_role=os.getenv('COLLECTOR_ROLE', default_role),
         worker_id=os.getenv('COLLECTOR_ID') or None,
+        priority_size=max(1, min(10000, int(os.getenv('STEAM_PRIORITY_SIZE', '400')))),
+        bulk_key=os.getenv('STEAMAPIS_KEY', '').strip(),
+        bulk_interval=max(60, int(os.getenv('STEAMAPIS_REFRESH_INTERVAL', '60'))),
+        bulk_currency=os.getenv('STEAMAPIS_CURRENCY', 'USD').upper(),
     )
 
 
@@ -52,6 +56,8 @@ def create_app(service=None, start_collector=False):
     def health():
         return jsonify(status='ok', collector_running=service.collector_running(),
                        collector_role=service.collector_role,
+                       scanner_mode='hybrid' if service.bulk_key or service.bulk_orders else 'priority',
+                       bulk_configured=bool(service.bulk_key),
                        storage={**service.storage_status})
 
     @app.get('/')

@@ -173,6 +173,7 @@ class Store:
         values['collector_state'] = {
             'attempted': {name: attempted for name, _, _, attempted in jobs if attempted},
             'checked_names': [name for name, _, checked, _ in jobs if checked],
+            'checked_at': {name: checked for name, _, checked, _ in jobs if checked},
             'scan_turn': steam.get('scan_turn', 0),
             'retry_at': {source: state.get('retry_at', 0) for source, state in controls.items()},
             'failures': {source: state.get('failures', 0) for source, state in controls.items()},

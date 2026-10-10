@@ -12,10 +12,11 @@ export type Snapshot = {
   pending_items?: Opportunity[]; catalog_ttl_seconds?: number; pending_ttl_seconds?: number;
   steam_request_interval_seconds?: number; pending_total?: number; attempted_total?: number;
   storage?: { backend: 'sqlite' | 'postgresql'; persistent: boolean; state: 'ok' | 'error'; message?: string; last_synced_at: number | null };
+  scanner?: { mode: 'hybrid' | 'priority'; bulk_configured: boolean; priority_size: number; bulk_matched_total: number; bulk_generated_at: number | null };
   catalog_total: number; checked_total: number; fresh_quotes: number; stale_quotes: number;
   profitable_total: number; best_roi: number | null; catalog_updated_at: number | null;
   catalog_checked_at: number | null; last_cycle_at: number | null; collecting: boolean;
-  sources: Record<'lis' | 'steam' | 'fx', SourceStatus>;
+  sources: Record<'lis' | 'steam' | 'fx', SourceStatus> & { steamapis?: SourceStatus };
   fx: { rub_per_usd: string; date: string; checked_at: number; usd_per_currency: Record<string, string> } | null;
   skipped_variants: number; deposit_fee_percent: number;
 }

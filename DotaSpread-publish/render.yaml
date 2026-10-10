@@ -25,3 +25,9 @@ services:
         value: "1800"
       - key: STEAM_REQUEST_INTERVAL
         value: "4"
+      - key: STEAM_PRIORITY_SIZE
+        value: "400"
+      - key: STEAMAPIS_REFRESH_INTERVAL
+        value: "60"
+      - key: STEAMAPIS_CURRENCY
+        value: "USD"
