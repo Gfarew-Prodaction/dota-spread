@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from .local_worker import load_config
+from . import local_worker
 from .providers import SourceError
 from .service import MarketService
 from .store import Store
@@ -56,6 +57,30 @@ class LocalConfigTests(unittest.TestCase):
         self.assertEqual(environ['STEAM_PRIORITY_SIZE'], '100')
         with self.assertRaises(ValueError):
             load_config(self.path, {'COLLECTOR_ROLE': 'none'})
+
+    def test_stop_does_not_signal_an_unrelated_process(self):
+        root = Path(self.directory.name)
+        (root / '.cache').mkdir()
+        (root / '.cache/home-collector.lock').write_text('123')
+        with patch.object(local_worker, 'ROOT', root), \
+             patch('backend.local_worker.fcntl.flock', side_effect=BlockingIOError), \
+             patch('backend.local_worker.subprocess.run') as process, \
+             patch('backend.local_worker.os.kill') as kill:
+            process.return_value.stdout = 'python unrelated.py\n'
+            self.assertEqual(local_worker.stop_collector(), 1)
+            kill.assert_not_called()
+
+    def test_stop_signals_only_the_confirmed_worker(self):
+        root = Path(self.directory.name)
+        (root / '.cache').mkdir()
+        (root / '.cache/home-collector.lock').write_text('123')
+        with patch.object(local_worker, 'ROOT', root), \
+             patch('backend.local_worker.fcntl.flock', side_effect=BlockingIOError), \
+             patch('backend.local_worker.subprocess.run') as process, \
+             patch('backend.local_worker.os.kill') as kill:
+            process.return_value.stdout = '/path/python -m backend.local_worker\n'
+            self.assertEqual(local_worker.stop_collector(), 0)
+            kill.assert_called_once_with(123, local_worker.signal.SIGTERM)
 
 
 class PriceDropQueueTests(unittest.TestCase):
