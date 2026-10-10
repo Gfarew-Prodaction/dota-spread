@@ -1,7 +1,7 @@
 import os
 
 bind = f"0.0.0.0:{os.getenv('PORT', '10000')}"
-# The collector lives in the web worker. Multiple workers would duplicate requests.
+# One process keeps the small instance lightweight; PostgreSQL coordinates collectors.
 workers = 1
 worker_class = 'gthread'
 threads = 4

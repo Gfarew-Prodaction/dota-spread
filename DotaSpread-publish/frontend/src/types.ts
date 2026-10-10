@@ -11,6 +11,7 @@ export type Snapshot = {
   items: Opportunity[]; server_time: number; interval_seconds: number; quote_ttl_seconds: number;
   pending_items?: Opportunity[]; catalog_ttl_seconds?: number; pending_ttl_seconds?: number;
   steam_request_interval_seconds?: number; pending_total?: number; attempted_total?: number;
+  storage?: { backend: 'sqlite' | 'postgresql'; persistent: boolean; state: 'ok' | 'error'; message?: string; last_synced_at: number | null };
   catalog_total: number; checked_total: number; fresh_quotes: number; stale_quotes: number;
   profitable_total: number; best_roi: number | null; catalog_updated_at: number | null;
   catalog_checked_at: number | null; last_cycle_at: number | null; collecting: boolean;

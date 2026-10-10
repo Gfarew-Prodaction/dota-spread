@@ -192,6 +192,7 @@ export default function App() {
         </section>
 
         {error && <div className="notice error-notice" role="alert"><Activity size={16} />{error}<button onClick={() => void fetchData()}>Повторить</button></div>}
+        {data?.storage?.state === 'error' && <div className="notice source-notice"><Clock3 size={16} /><div>Обновление цен временно недоступно. Показаны последние полученные данные; время каждой котировки указано в таблице.</div></div>}
         {data && Object.entries(data.sources).some(([, status]) => ['error', 'stale', 'cooldown'].includes(status.state)) && <div className="notice source-notice"><Clock3 size={16} /><div>{Object.entries(data.sources).filter(([, status]) => ['error', 'stale', 'cooldown'].includes(status.state)).map(([key, status]) => <span key={key}>{sourceLabel(key)}: {sourceMessage(status)} </span>)}</div></div>}
 
         <section className="market-panel">

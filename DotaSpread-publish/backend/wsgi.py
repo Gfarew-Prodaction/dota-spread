@@ -1,4 +1,4 @@
-"""Production entry point: imported once by the single Gunicorn worker."""
+"""Production entry point; COLLECTOR_ROLE controls background collection."""
 
 import logging
 

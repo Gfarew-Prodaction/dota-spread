@@ -9,6 +9,8 @@ services:
     dockerContext: .
     healthCheckPath: /api/health
     envVars:
+      - key: COLLECTOR_ROLE
+        value: "all"
       - key: UPDATE_INTERVAL
         value: "10"
       - key: STEAM_BATCH_SIZE

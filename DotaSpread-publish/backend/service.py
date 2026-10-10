@@ -1,6 +1,8 @@
 import logging
+import os
 import threading
 import time
+import uuid
 from decimal import Decimal
 from urllib.parse import quote
 
@@ -13,7 +15,9 @@ logger = logging.getLogger(__name__)
 class MarketService:
     def __init__(self, store, interval=10, batch_size=3, quote_ttl=120,
                  catalog_interval=60, catalog_ttl=600, pending_ttl=1800,
-                 steam_request_interval=4):
+                 steam_request_interval=4, collector_role='all', worker_id=None):
+        if collector_role not in ('all', 'sources', 'steam', 'none'):
+            raise ValueError('COLLECTOR_ROLE: all, sources, steam или none.')
         self.store = store
         self.interval = interval
         self.batch_size = batch_size
@@ -22,126 +26,228 @@ class MarketService:
         self.catalog_ttl = catalog_ttl
         self.pending_ttl = max(pending_ttl, quote_ttl, catalog_ttl)
         self.base_request_interval = steam_request_interval
+        self.collector_role = collector_role
+        self.worker_id = worker_id or f'{os.getpid()}-{uuid.uuid4().hex[:8]}'
         self.lock = threading.RLock()
+        self.sync_lock = threading.Lock()
         self.stop = threading.Event()
-        # Independently scheduled sources own separate requests.Session objects.
         self.session = client()
         self.catalog_session = client()
         self.fx_session = client()
-        self.catalog = store.get('catalog', [])
-        self.quotes = store.get('quotes', {})
-        self.fx = store.get('fx')
-        self.catalog_updated_at = store.get('catalog_updated_at', 0)
-        self.catalog_checked_at = store.get('catalog_checked_at', 0)
-        self.catalog_etag = store.get('catalog_etag')
-        self.skipped = store.get('skipped', 0)
-        state = store.get('collector_state', {})
-        self.attempted = state.get('attempted', {})
-        self.checked_names = set(state.get('checked_names', [])) | set(self.quotes)
-        self.scan_turn = state.get('scan_turn', 0)
-        self.retry_at = {source: state.get('retry_at', {}).get(source, 0) for source in ('lis', 'steam', 'fx')}
-        self.failures = {source: state.get('failures', {}).get(source, 0) for source in self.retry_at}
-        self.request_interval = max(steam_request_interval, state.get('request_interval', steam_request_interval))
+        self.catalog, self.quotes, self.fx = [], {}, None
+        self.catalog_updated_at = self.catalog_checked_at = 0
+        self.catalog_etag = None
+        self.skipped = 0
+        self.attempted, self.checked_names = {}, set()
+        self.scan_turn = 0
+        self.retry_at = {source: 0 for source in ('lis', 'steam', 'fx')}
+        self.failures = dict(self.retry_at)
+        self.request_interval = steam_request_interval
         self.success_streak = 0
         self.next_steam_at = 0
         self.status = {
-            'lis': {'state': 'ok' if self.catalog else 'loading', 'message': 'Каталог доступен' if self.catalog else 'Загружаем каталог'},
+            'lis': {'state': 'loading', 'message': 'Загружаем каталог'},
             'steam': {'state': 'loading', 'message': 'Проверяем ордера'},
-            'fx': {'state': 'ok' if self.fx else 'loading', 'message': 'Курс Банка России' if self.fx else 'Получаем курс'},
+            'fx': {'state': 'loading', 'message': 'Получаем курс'},
         }
-        for source, retry_at in self.retry_at.items():
-            if retry_at > time.time():
-                self.status[source] = {'state': 'cooldown', 'message': 'Ожидаем следующую разрешённую проверку'}
+        self.controls = {}
         self.last_cycle = None
         self.cycle_running = False
-        self.thread = None
-        self.source_thread = None
+        self.thread = self.source_thread = None
+        self.next_sync_at = 0
+        self.snapshot_versions = self.steam_revision = None
+        self.storage_retry_at = 0
+        self.storage_status = {'backend': store.backend, 'persistent': store.persistent,
+                               'state': 'ok', 'last_synced_at': None}
+        self.refresh_shared(force=True)
 
     def start(self):
-        if self.thread and self.thread.is_alive():
+        if self.collector_role == 'none' or self.collector_running():
             return
-        self.source_thread = threading.Thread(target=self.run_sources, name='catalog-collector', daemon=True)
-        self.thread = threading.Thread(target=self.run, name='steam-collector', daemon=True)
-        self.source_thread.start()
-        self.thread.start()
+        if self.collector_role in ('all', 'sources'):
+            self.source_thread = threading.Thread(target=self.run_sources, name='catalog-collector', daemon=True)
+            self.source_thread.start()
+        if self.collector_role in ('all', 'steam'):
+            self.thread = threading.Thread(target=self.run, name='steam-collector', daemon=True)
+            self.thread.start()
+
+    def collector_running(self):
+        required = []
+        if self.collector_role in ('all', 'sources'):
+            required.append(self.source_thread)
+        if self.collector_role in ('all', 'steam'):
+            required.append(self.thread)
+        return bool(required) and all(thread and thread.is_alive() for thread in required)
 
     def close(self):
         self.stop.set()
+        for thread in (self.thread, self.source_thread):
+            if thread and thread is not threading.current_thread():
+                thread.join(timeout=2)
         for session in (self.session, self.catalog_session, self.fx_session):
             session.close()
+        self.store.close()
 
-    def save_state(self):
+    def _apply_control(self, source, state):
         with self.lock:
-            state = {
-                'attempted': dict(self.attempted), 'checked_names': sorted(self.checked_names),
-                'scan_turn': self.scan_turn, 'retry_at': dict(self.retry_at),
-                'failures': dict(self.failures), 'request_interval': self.request_interval,
-            }
-        self.store.put('collector_state', state)
+            self.controls[source] = dict(state)
+            self.retry_at[source] = state.get('retry_at', 0)
+            self.failures[source] = state.get('failures', 0)
+            if state.get('state'):
+                self.status[source] = {'state': state['state'], 'message': state.get('message', '')}
+            elif self.retry_at[source] > time.time():
+                self.status[source] = {'state': 'cooldown', 'message': 'Ожидаем следующую разрешённую проверку'}
+            if source == 'steam':
+                self.scan_turn = state.get('scan_turn', 0)
+                self.request_interval = max(self.base_request_interval, state.get('request_interval', self.base_request_interval))
+                self.success_streak = state.get('success_streak', 0)
+                self.next_steam_at = max(state.get('next_at', 0), state.get('lease_until', 0))
+                self.last_cycle = state.get('last_cycle_at', self.last_cycle)
+
+    def _storage_error(self):
+        with self.lock:
+            first_failure = self.storage_status['state'] != 'error'
+            self.storage_status.update(state='error', message='База временно недоступна. Показаны последние полученные цены.')
+            self.storage_retry_at = time.time() + 10
+        if first_failure:
+            logger.warning('Shared database unavailable; retaining last prices and pausing collection')
+
+    def refresh_shared(self, force=False):
+        with self.sync_lock:
+            if not force and time.monotonic() < self.next_sync_at:
+                return self.storage_status['state'] == 'ok'
+            self.next_sync_at = time.monotonic() + self.interval
+            try:
+                data = self.store.read_market(known_versions=self.snapshot_versions, since_revision=self.steam_revision)
+            except Exception:
+                self._storage_error()
+                return False
+            with self.lock:
+                for key in ('catalog', 'catalog_updated_at', 'catalog_checked_at', 'catalog_etag', 'skipped', 'fx'):
+                    if key in data:
+                        setattr(self, key, data[key])
+                if data['incremental']:
+                    for name, quote_data in data['quotes'].items():
+                        if quote_data is None:
+                            self.quotes.pop(name, None)
+                        else:
+                            self.quotes[name] = quote_data
+                else:
+                    self.quotes = data['quotes']
+                state = data['collector_state']
+                self.attempted.update(state['attempted'])
+                self.checked_names.update(state['checked_names'])
+                self.checked_names.update(self.quotes)
+                for source, control in data['controls'].items():
+                    self._apply_control(source, control)
+                if self.catalog and self.status['lis']['state'] == 'loading':
+                    self.status['lis'] = {'state': 'ok', 'message': 'Каталог доступен'}
+                if self.fx and self.status['fx']['state'] == 'loading':
+                    self.status['fx'] = {'state': 'ok', 'message': 'Курс Банка России'}
+                self.storage_retry_at = 0
+                self.snapshot_versions = data['snapshot_versions']
+                self.steam_revision = data['steam_revision']
+                self.storage_status = {'backend': self.store.backend, 'persistent': self.store.persistent,
+                                       'state': 'ok', 'last_synced_at': time.time()}
+            return True
+
+    def _failure_state(self, source, state, error):
+        state = dict(state)
+        failures = state.get('failures', 0) + 1
+        kind = getattr(error, 'kind', 'network')
+        base = 300 if kind in ('rate_limit', 'access') else 60
+        wait = max(getattr(error, 'retry_after', 60), min(3600, base * 2 ** min(failures - 1, 6)))
+        state.update(failures=failures, retry_at=time.time() + wait, state='cooldown',
+                     message=str(error) if isinstance(error, SourceError) else 'Не удалось получить данные. Повторим запрос позже.')
+        if source == 'steam':
+            state['success_streak'] = 0
+            interval = max(self.base_request_interval, state.get('request_interval', self.base_request_interval))
+            state['request_interval'] = min(120, interval * 2) if kind in ('rate_limit', 'access') else interval
+            state['next_at'] = time.time() + state['request_interval']
+        return state
+
+    def _success_state(self, source, state, message):
+        state = dict(state)
+        state.update(state='ok', message=message, retry_at=0)
+        if source == 'steam':
+            streak = state.get('success_streak', 0) + 1
+            interval = max(self.base_request_interval, state.get('request_interval', self.base_request_interval))
+            if streak >= 20:
+                state.update(failures=0)
+                interval = max(self.base_request_interval, interval * .9)
+                streak = 0
+            state.update(success_streak=streak, request_interval=interval, next_at=time.time() + interval)
+        else:
+            state.update(failures=0, next_at=time.time() + (self.catalog_interval if source == 'lis' else 3600))
+        return state
 
     def fail(self, source, error):
-        with self.lock:
-            self.failures[source] += 1
-            kind = getattr(error, 'kind', 'network')
-            base = 300 if kind in ('rate_limit', 'access') else 60
-            wait = max(getattr(error, 'retry_after', 60), min(3600, base * 2 ** min(self.failures[source] - 1, 6)))
-            self.status[source] = {
-                'state': 'cooldown',
-                'message': str(error) if isinstance(error, SourceError) else 'Не удалось получить данные. Повторим запрос позже.',
-            }
-            self.retry_at[source] = time.time() + wait
-            if source == 'steam':
-                self.success_streak = 0
-                if kind in ('rate_limit', 'access'):
-                    self.request_interval = min(120, self.request_interval * 2)
-        self.save_state()
-        logger.warning('%s collection paused for %ss: %s', source, wait, error)
+        state = self.store.mutate_control(source, lambda current: self._failure_state(source, current, error))
+        self._apply_control(source, state)
 
     def succeed(self, source, message):
-        with self.lock:
-            self.status[source] = {'state': 'ok', 'message': message}
-            self.retry_at[source] = 0
-            if source == 'steam':
-                self.success_streak += 1
-                # One successful request does not undo a rate-limit recovery.
-                if self.success_streak >= 20:
-                    self.failures[source] = 0
-                    self.request_interval = max(self.base_request_interval, self.request_interval * .9)
-                    self.success_streak = 0
-            else:
-                self.failures[source] = 0
+        state = self.store.mutate_control(source, lambda current: self._success_state(source, current, message))
+        self._apply_control(source, state)
+
+    def _claim(self, source, candidates=None):
+        if time.time() < self.storage_retry_at:
+            return None
+        claim = self.store.claim(source, self.worker_id, candidates=candidates,
+                                 lease_seconds=600 if source == 'lis' else 180,
+                                 request_interval=self.base_request_interval)
+        self._apply_control(source, claim['control'])
+        return claim if claim.get('token') else None
+
+    def _complete(self, source, claim, message=None, error=None, values=None, quote_data=None, checked=False):
+        update = (lambda current: self._failure_state(source, current, error)) if error else \
+                 (lambda current: self._success_state(source, current, message))
+        result = self.store.complete(source, claim['token'], update, values=values,
+                                     name=claim.get('name'), quote_data=quote_data, checked=checked)
+        self._apply_control(source, result['control'])
+        if result['accepted']:
+            with self.lock:
+                for key, value in (values or {}).items():
+                    setattr(self, key, value)
+                if source == 'steam' and checked:
+                    name = claim['name']
+                    self.checked_names.add(name)
+                    if quote_data is None:
+                        self.quotes.pop(name, None)
+                    else:
+                        self.quotes[name] = quote_data
+        return result['accepted']
 
     def collect_catalog(self):
         now = time.time()
         if now < self.retry_at['lis'] or now - self.catalog_checked_at < self.catalog_interval:
             return
+        claim = self._claim('lis')
+        if not claim:
+            return
         try:
             result = read_catalog(self.catalog_session, self.catalog_etag)
-            with self.lock:
-                if result is not None:
-                    self.catalog, self.catalog_updated_at, self.skipped, self.catalog_etag = result
-                # A 304 checks availability without changing the source price time.
-                self.catalog_checked_at = time.time()
-                saved = {'catalog_checked_at': self.catalog_checked_at, 'catalog_etag': self.catalog_etag}
-                if result is not None:
-                    saved.update(catalog=self.catalog, catalog_updated_at=self.catalog_updated_at, skipped=self.skipped)
-            self.succeed('lis', 'Каталог доступен')
-            for key, value in saved.items():
-                self.store.put(key, value)
         except Exception as error:
-            self.fail('lis', error)
+            self._complete('lis', claim, error=error)
+            return
+        saved = {'catalog_checked_at': time.time(), 'catalog_etag': self.catalog_etag}
+        if result is not None:
+            catalog, updated, skipped, etag = result
+            saved.update(catalog=catalog, catalog_updated_at=updated, skipped=skipped, catalog_etag=etag)
+        # A 304 checks availability without changing the source's price timestamp.
+        self._complete('lis', claim, 'Каталог доступен', values=saved)
 
     def collect_fx(self):
         if time.time() < self.retry_at['fx'] or (self.fx and time.time() - self.fx['checked_at'] < 3600):
             return
+        claim = self._claim('fx')
+        if not claim:
+            return
         try:
             rates = read_fx(self.fx_session)
-            with self.lock:
-                self.fx = rates
-            self.succeed('fx', 'Курс Банка России')
-            self.store.put('fx', rates)
         except Exception as error:
-            self.fail('fx', error)
+            self._complete('fx', claim, error=error)
+            return
+        self._complete('fx', claim, 'Курс Банка России', values={'fx': rates})
 
     def choose_candidates(self):
         """Reserve two discovery slots per refresh and leave fresh winners cached."""
@@ -179,50 +285,39 @@ class MarketService:
         return selected
 
     def collect_steam(self, limit=None):
-        if not self.catalog or time.time() < max(self.retry_at['steam'], self.next_steam_at):
+        if not self.catalog or time.time() < max(self.retry_at['steam'], self.next_steam_at, self.storage_retry_at):
             return
+        # The shared gate permits one request at a time across all collectors.
+        # Selection is cached locally; claim() rejects stale selections atomically.
         candidates = self.choose_candidates()
-        if limit is not None:
-            candidates = candidates[:limit]
-        for index, item in enumerate(candidates):
-            if self.stop.is_set():
-                break
-            name = item['name']
-            with self.lock:
-                self.attempted[name] = time.time()
-                self.scan_turn += 1
-            try:
-                result = read_steam(self.session, name)
-                with self.lock:
-                    self.quotes[name] = result
-                    self.checked_names.add(name)
-                self.succeed('steam', 'Проверяем новые предметы и обновляем найденные ордера')
-                self.store.put('quotes', dict(self.quotes))
-            except Exception as error:
-                if not isinstance(error, SourceError) or error.kind != 'item':
-                    self.fail('steam', error)
-                    break
-                with self.lock:
-                    self.checked_names.add(name)
-                    # A newer unavailable response invalidates the old quote.
-                    self.quotes.pop(name, None)
-                self.store.put('quotes', dict(self.quotes))
-                self.succeed('steam', 'Проверяем каталог; часть предметов не имеет подходящего ордера')
-                logger.info('No usable Steam quote for %s: %s', name, error)
-            finally:
-                with self.lock:
-                    self.next_steam_at = time.time() + self.request_interval
-                self.save_state()
-            if index + 1 < len(candidates) and self.stop.wait(self.request_interval):
-                break
+        if not candidates:
+            return
+        claim = self._claim('steam', [(item['name'], self.attempted.get(item['name'], 0)) for item in candidates])
+        if not claim:
+            self.refresh_shared(force=True)
+            return
+        name = claim['name']
+        with self.lock:
+            self.attempted[name] = claim['claimed_at']
+        try:
+            result = read_steam(self.session, name)
+        except Exception as error:
+            unavailable = isinstance(error, SourceError) and error.kind == 'item'
+            self._complete('steam', claim, error=None if unavailable else error,
+                           message='Проверяем каталог; часть предметов не имеет подходящего ордера' if unavailable else None,
+                           checked=unavailable)
+            return
+        self._complete('steam', claim, 'Проверяем новые предметы и обновляем найденные ордера',
+                       quote_data=result, checked=True)
 
     def run_sources(self):
         while not self.stop.is_set():
             try:
-                self.collect_catalog()
-                self.collect_fx()
+                if self.refresh_shared():
+                    self.collect_catalog()
+                    self.collect_fx()
             except Exception:
-                logger.exception('Catalog collection failed')
+                self._storage_error()
             self.stop.wait(self.interval)
 
     def run(self):
@@ -230,17 +325,17 @@ class MarketService:
             with self.lock:
                 self.cycle_running = True
             try:
-                # Steam scanning continues while the catalog downloads separately.
-                self.collect_steam(limit=1)
+                if self.refresh_shared():
+                    self.collect_steam(limit=1)
             except Exception:
-                logger.exception('Steam collection failed')
+                self._storage_error()
             finally:
                 with self.lock:
-                    self.last_cycle = time.time()
                     self.cycle_running = False
             self.stop.wait(1)
 
     def snapshot(self, deposit_fee_percent=0):
+        self.refresh_shared()
         now = time.time()
         with self.lock:
             catalog = list(self.catalog)
@@ -248,7 +343,9 @@ class MarketService:
             fx = dict(self.fx) if self.fx else None
             status = {key: {**value, 'retry_at': self.retry_at[key] or None} for key, value in self.status.items()}
             catalog_updated, catalog_checked = self.catalog_updated_at, self.catalog_checked_at
-            running, cycle = self.cycle_running, self.last_cycle
+            running = self.controls.get('steam', {}).get('lease_until', 0) > now
+            cycle = self.last_cycle
+            storage = dict(self.storage_status)
             checked_names = set(self.checked_names) | set(quotes)
             attempted_names = set(self.attempted)
             request_interval = self.request_interval
@@ -304,6 +401,7 @@ class MarketService:
         names = {item['name'] for item in catalog}
         return {
             'items': items, 'pending_items': pending_items, 'server_time': now, 'interval_seconds': self.interval,
+            'storage': storage,
             'quote_ttl_seconds': self.quote_ttl, 'catalog_ttl_seconds': self.catalog_ttl,
             'pending_ttl_seconds': self.pending_ttl, 'steam_request_interval_seconds': request_interval,
             'catalog_total': len(catalog), 'checked_total': len(checked_names & names),
